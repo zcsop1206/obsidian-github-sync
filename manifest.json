@@ -1,0 +1,9 @@
+{
+  "id": "github-api-sync",
+  "name": "GitHub API sync",
+  "version": "0.0.1",
+  "minAppVersion": "1.7.2",
+  "description": "Syncs a vault folder with a GitHub repo through the REST API, for devices without git.",
+  "author": "Adit Bhargava",
+  "isDesktopOnly": false
+}
