@@ -31,33 +31,67 @@ Ink and audio live in a separate plugin, `zcsop1206/obsidian-notebook`. That rep
 
 - **What the device's vault holds:** the whole portfolio repo, or only a notebook folder inside it. The whole repo brings the site's code onto the iPad, where it's of little use, so it would need ignoring. The plugin's settings allow either (vault folder ↔ repo folder).
 
-## Design (not built yet)
+## How sync works (0.1.0)
 
 - **Auth:** a fine-grained personal access token with Contents read/write on one repo, entered in the plugin settings and stored in the plugin's `data.json`.
   - That file sits at `.obsidian/plugins/github-api-sync/data.json`. It must never be synced or committed: the plugin always ignores it, and the laptop's `.gitignore` must exclude it too if `.obsidian/` lives in the repo.
-- **Config:** repo (`owner/name`), branch, the vault folder and the repo folder it maps to.
-- **State:** the last synced commit SHA, plus each file's blob SHA at that commit.
-- **Pull:** compare the last synced commit to the branch head (`GET /repos/{o}/{r}/compare/{base}...{head}`, or a tree diff), then download changed blobs.
-- **Push:** local changes are files whose content hash differs from the recorded blob SHA (git blob SHA-1 = `sha1("blob <len>\0" + bytes)`). Create blobs, a tree with `base_tree`, and a commit, then update the ref. If the ref moved, pull first and retry.
-- **Conflicts:** if a file changed on both sides, keep both (`name (iPad).md`) and show a notice. Never silently overwrite.
-- **Deletes and renames** need explicit handling and tests.
-- **Never block the editor:** async with a concurrency cap, visible progress, cancellable.
-- **What syncs:** only note and attachment extensions, with an ignore list that includes `.obsidian/workspace*.json`, this plugin's `data.json`, audio, and `private/`.
-- **Testing:** hard, against a throwaway repo, before it touches real notes. Desktop Obsidian or a headless harness on the laptop is fine for that.
+- **Config:** repo (`owner/name`), branch, the vault folder and the repo folder it maps to, a device name, and ignore rules.
+- **State** (in `data.json` next to the settings):
+  - the commit the last sync ended on;
+  - the base: each synced file's git blob SHA at that sync;
+  - a local cache of mtime, size and SHA, so unchanged files aren't re-read and rehashed;
+  - a key made of repo, branch and both folders. Changing any of them resets the state, so the next sync is a first sync.
+- **Each sync:**
+  1. Read the branch head and its full tree (`git/trees/{sha}?recursive=1`), then hash the vault folder (git blob SHA-1 = `sha1("blob <len>\0" + bytes)`).
+  2. Compare each path three ways (base, vault, GitHub):
+     - changed only on GitHub → pulled;
+     - changed only in the vault → pushed;
+     - changed on both → GitHub's version keeps the path, the vault's is kept as `name (conflict <device> <date>).ext` and pushed;
+     - a change beats a delete on the other side.
+  3. Pull: download changed blobs; files deleted on GitHub go to the vault's `.trash` via `trashLocal`.
+  4. Push: upload only blobs GitHub doesn't already have, make a tree on the head's tree (`sha: null` for deletes) and one commit, then move the branch without force. If the branch moved meanwhile, the whole sync starts again (up to 3 tries).
+  5. Save the state only after everything succeeded. A sync that stops partway is safe to repeat.
+- **First sync** (empty base): nothing is deleted on either side; files that differ become conflict copies.
+- **Guards:**
+  - Deleting more than 10 files, and more than 25% of the synced files, asks first.
+  - If the vault folder has vanished after a sync, it refuses to run, so a missing folder can't delete everything on GitHub.
+  - An uploaded blob whose SHA doesn't match the hash stops the sync (the file changed mid-sync, or the hashing is wrong).
+- **Pull only:** the same, minus the push. Local changes are held back and go out on the next full sync.
+- **Ignore rules** (editable, apply to both sides, relative to the synced folder): `*.ext` = that extension anywhere; `name/` = that folder anywhere; anything else = that exact path, or that file name anywhere if it has no slash. Defaults: `.obsidian/`, `private/`, and `m4a`, `webm`, `ogg`, `mp3`, `wav`. Always ignored: this plugin's `data.json`, `.git/`, `.trash/`, `.DS_Store`.
+- **Renames** are a delete plus an add. The content isn't uploaded again, because its blob already exists on GitHub.
+- **Symlinks** (mode `120000`) and submodules in the repo are skipped.
+- **UI:**
+  - Ribbon icon and command "Sync now (pull and push)";
+  - command "Pull only";
+  - command "Check GitHub connection";
+  - buttons for all three in settings, plus "Forget sync history", which resets the state;
+  - a progress notice while syncing and a one-line result afterwards.
+- **Limits:**
+  - One GitHub request per changed file, four at a time, so the first sync of a big vault takes a while.
+  - Repos whose tree is too large for one request (GitHub truncates past about 100k entries) aren't supported.
+  - There is no cancel button yet.
+  - Sync is manual: it doesn't run on a timer or when Obsidian opens.
 
-## What exists now (0.0.1, the skeleton)
+## Verified so far
 
-- Settings tab: token (password field), repo, branch, vault folder, repo folder.
-- Command and button "Check GitHub connection": reads the repo, the branch head and the repo folder, and reports what it found or the API error. It can't prove write access without writing, so that's checked on the first push.
-- No sync yet.
+`test/run_sync_test.js` against the real throwaway repo `zcsop1206/notebook-sync-test` (private). Each run uses its own temporary branch cut from `main`, which holds the seed files, and deletes it afterwards. All 20 checks pass:
+- first sync, ignore rules, binary files byte-exact;
+- push of an edit, an add and a delete;
+- conflicts on first sync and on a normal sync;
+- pull only;
+- remote delete to `.trash`;
+- the branch moving mid-push;
+- the mass-delete prompt, both cancelled and confirmed;
+- folder mapping;
+- the missing-folder guard.
+
+Not yet run inside Obsidian. The settings tab, the `requestUrl` and adapter behaviour on iOS (including `list('/')` for a whole-vault sync), `crypto.subtle` in the iOS web view and `trashLocal` on mobile are all untested there.
 
 ## Next steps
 
-1. Install on the iPad through BRAT, enter a token for a throwaway repo, run the connection check.
-2. Pull only: download the repo folder into the vault folder and record state.
-3. Push: detect local changes by blob SHA and commit them.
-4. Conflicts, deletes, renames, progress and cancelling.
-5. A headless test harness like the notebook plugin's (`test/` there: Playwright, a mock `obsidian` module, an in-memory vault), with `requestUrl` pointed at a fake GitHub.
+1. Install 0.1.0 on the iPad through BRAT. Enter a token scoped to `zcsop1206/notebook-sync-test` only, then check the connection and sync. Edit on the iPad and on the laptop (plain git clone of the test repo) and sync back and forth, including a conflict.
+2. Settle the open question above, then point it at the real repo.
+3. Consider: sync on open or on a timer, a cancel button, a status indicator for unsynced changes.
 
 ## Repo mechanics
 
