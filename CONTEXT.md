@@ -74,7 +74,7 @@ Ink and audio live in a separate plugin, `zcsop1206/obsidian-notebook`. That rep
 
 ## Verified so far
 
-`test/run_sync_test.js` against the real throwaway repo `zcsop1206/notebook-sync-test` (private). Each run uses its own temporary branch cut from `main`, which holds the seed files, and deletes it afterwards. All 20 checks pass:
+`test/run_sync_test.js` against the real throwaway repo `zcsop1206/notebook-sync-test` (private). Each run uses its own temporary branch cut from the repo's `seed` tag (the seed commit), so it doesn't depend on what `main` holds, and deletes the branch afterwards. All 20 checks pass:
 - first sync, ignore rules, binary files byte-exact;
 - push of an edit, an add and a delete;
 - conflicts on first sync and on a normal sync;

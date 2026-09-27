@@ -2,8 +2,9 @@
 // Runs the plugin in Node against a real throwaway GitHub repo, with a mock obsidian module
 // and temp folders as vaults. Each run works on its own branch, deleted at the end.
 //   node test/run_sync_test.js owner/repo
-// Token: GITHUB_TOKEN, else `gh auth token`. The repo's main branch must hold the seed files
-// (README.md, notes/hello.md, notes/sub/deep.md, media/pixel.png, .obsidian/app.json, private/secret.md).
+// Token: GITHUB_TOKEN, else `gh auth token`. The repo needs a `seed` tag on a commit holding exactly
+// README.md, notes/hello.md, notes/sub/deep.md, media/pixel.png, .obsidian/app.json, private/secret.md,
+// so the test doesn't depend on whatever main holds now.
 
 const fs = require('fs'), os = require('os'), path = require('path'), Module = require('module');
 const { execSync } = require('child_process');
@@ -123,8 +124,8 @@ function check(name, ok, detail = '') {
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 (async () => {
-  const main = await api(`/repos/${REPO}/git/ref/heads/main`);
-  await api(`/repos/${REPO}/git/refs`, 'POST', { ref: `refs/heads/${BRANCH}`, sha: main.object.sha });
+  const seed = await api(`/repos/${REPO}/git/ref/tags/seed`);
+  await api(`/repos/${REPO}/git/refs`, 'POST', { ref: `refs/heads/${BRANCH}`, sha: seed.object.sha });
   console.log(`branch ${BRANCH}`);
   try {
     const A = await device('A');
