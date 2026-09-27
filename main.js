@@ -360,7 +360,8 @@ module.exports = class GitHubApiSync extends Plugin {
   conflictName(rel, taken) {
     const slash = rel.lastIndexOf('/'), dot = rel.lastIndexOf('.');
     const [stem, ext] = dot > slash + 1 ? [rel.slice(0, dot), rel.slice(dot)] : [rel, ''];
-    const tag = `conflict ${this.settings.device} ${new Date().toISOString().slice(0, 10)}`;
+    const d = new Date(), pad = n => String(n).padStart(2, '0');
+    const tag = `conflict ${this.settings.device} ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; // local date, not UTC
     let name = `${stem} (${tag})${ext}`;
     for (let i = 2; taken.has(name); i++) name = `${stem} (${tag} ${i})${ext}`;
     taken.add(name);
