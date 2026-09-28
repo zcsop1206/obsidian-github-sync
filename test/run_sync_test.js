@@ -10,6 +10,7 @@ const fs = require('fs'), os = require('os'), path = require('path'), Module = r
 const { execSync } = require('child_process');
 
 const REPO = process.argv[2];
+if (!REPO && process.env.NODE_TEST_CONTEXT) { console.log('# skipped: needs a repo, run it directly'); process.exit(0); } // under `node --test`
 if (!REPO) { console.error('usage: node test/run_sync_test.js owner/repo'); process.exit(2); }
 const TOKEN = process.env.GITHUB_TOKEN || execSync('gh auth token').toString().trim();
 const BRANCH = `sync-test-${Date.now()}`;
@@ -206,6 +207,22 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
     fs.rmSync(path.join(D.app.vault.adapter.root, 'gone'), { recursive: true });
     r = await D.sync();
     check('missing vault folder after a sync refuses to run', r.includes('is missing'), r);
+
+    await A.sync(); // catch up with C
+    A.put('.gitignore', '*.tmp\nscratch/\n');
+    A.put('note.tmp', 'tmp\n');
+    r = await A.sync();
+    let rf3 = await remoteFiles();
+    check('a new .gitignore in the vault is pushed and applies in the same sync', rf3.includes('.gitignore') && !rf3.includes('note.tmp') && r === 'Synced: 1 change pushed. 1 local file skipped by .gitignore', `${r} ${rf3}`);
+    A.put('scratch/x.md', 'scratch\n');
+    await laptopPut('laptop.tmp', 'force-added on the laptop\n');
+    r = await A.sync();
+    rf3 = await remoteFiles();
+    check('.gitignore holds back local files, counts them, and blocks pulls', r === 'Already in sync. 2 local files skipped by .gitignore' && !rf3.includes('note.tmp') && !rf3.includes('scratch/x.md') && !A.files().includes('laptop.tmp'), `${r} ${rf3} ${A.files()}`);
+    A.settings.gitignore = false;
+    r = await A.sync();
+    rf3 = await remoteFiles();
+    check('with the setting off they go out, and come in', r === 'Synced: 1 change pulled, 2 changes pushed' && rf3.includes('note.tmp') && rf3.includes('scratch/x.md') && A.get('laptop.tmp') === 'force-added on the laptop\n', `${r} ${rf3}`);
   } finally {
     await api(`/repos/${REPO}/git/refs/heads/${BRANCH}`, 'DELETE');
   }

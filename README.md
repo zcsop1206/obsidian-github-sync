@@ -17,15 +17,16 @@ See `CONTEXT.md` for the design and status.
 4. Create a fine-grained personal access token with **Contents: read and write** on one repo only. Paste it into the plugin settings, fill in the repo and branch, and press **Check**.
 5. Press **Sync**, or use the ribbon icon or the command "Sync now (pull and push)".
 
-The settings also set which vault folder maps to which repo folder, the device name used in commit messages, and the ignore rules. By default `.obsidian/`, `private/` and audio files are ignored.
+The settings also set which vault folder maps to which repo folder, the device name used in commit messages, and the ignore rules. By default `.obsidian/`, `private/` and audio files are ignored. On top of those, the plugin honours the repo's `.gitignore` files (GitHub's copies and the vault's) in both directions, so a file git ignores on the laptop isn't pushed from the iPad either; the result notice says how many local files it held back. A switch in the settings turns this off.
 
 ## Test
 
 ```
+node --test
 node test/run_sync_test.js owner/repo
 ```
 
-Runs the plugin in Node against a real throwaway repo (`zcsop1206/notebook-sync-test`), on a temporary branch it deletes afterwards. It uses `GITHUB_TOKEN`, or else `gh auth token`.
+The first runs the offline tests (the `.gitignore` matcher). The second runs the plugin in Node against a real throwaway repo (`zcsop1206/notebook-sync-test`), on a temporary branch it deletes afterwards. It uses `GITHUB_TOKEN`, or else `gh auth token`.
 
 ## Release
 

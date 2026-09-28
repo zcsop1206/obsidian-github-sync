@@ -28,7 +28,7 @@ private/
 *.mp3
 *.wav`;
 const ALWAYS_IGNORE = ['.git/', '.trash/', '.DS_Store'];
-const DEFAULTS = { token: '', repo: '', branch: 'main', vaultFolder: '', repoFolder: '', device: '', ignore: DEFAULT_IGNORE };
+const DEFAULTS = { token: '', repo: '', branch: 'main', vaultFolder: '', repoFolder: '', device: '', ignore: DEFAULT_IGNORE, gitignore: true };
 const PARALLEL = 4;
 const MASS_DELETE = { count: 10, share: 0.25 }; // ask first when more deletes than both of these
 
@@ -47,6 +47,79 @@ function matches(path, rules) {
     : r.endsWith('/') ? path.startsWith(r) || path.includes(`/${r}`)
     : r.includes('/') ? path === r
     : name === r.toLowerCase());
+}
+
+// The repo's .gitignore files, applied on top of the plugin's own rules. Paths here are repo-relative,
+// and a trailing slash marks a folder. Matching is case-sensitive, as git is on GitHub.
+const reEscape = c => c.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
+const depth = dir => (dir ? dir.split('/').length : 0);
+
+// One gitignore glob, without its "!" and trailing "/", as RegExp source.
+function globSource(p) {
+  let re = '';
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === '*') {
+      const own = (i === 0 || p[i - 1] === '/') && p[i + 1] === '*';
+      if (own && i + 2 === p.length) { re += '.*'; i++; }                // trailing /** : everything inside
+      else if (own && p[i + 2] === '/') { re += '(?:.*/)?'; i += 2; }    // **/ : any folders, or none
+      else re += '[^/]*';                                                // * stops at a slash
+    } else if (c === '?') re += '[^/]';
+    else if (c === '[') {
+      let j = i + 1;
+      if (p[j] === '!' || p[j] === '^') j++;
+      if (p[j] === ']') j++;
+      j = p.indexOf(']', j);
+      if (j < 0) { re += '\\['; continue; }                               // no closing bracket: a plain [
+      let body = p.slice(i + 1, j);
+      const not = body[0] === '!' || body[0] === '^';
+      if (not) body = body.slice(1);
+      re += `[${not ? '^/' : ''}${body.replace(/[\\\]^[]/g, '\\$&')}]`;
+      i = j;
+    } else if (c === '\\' && i + 1 < p.length) re += reEscape(p[++i]);
+    else re += reEscape(c);
+  }
+  return re;
+}
+
+// A .gitignore's rules, scoped to the folder it sits in ('' for the repo root).
+function parseGitignore(text, dir = '') {
+  const rules = [];
+  for (let line of text.split('\n')) {
+    line = line.replace(/\r$/, '');
+    while (line.endsWith(' ') && !line.endsWith('\\ ')) line = line.slice(0, -1); // trailing spaces go unless escaped
+    if (!line || line[0] === '#') continue;
+    const neg = line[0] === '!';
+    if (neg) line = line.slice(1);
+    const dirOnly = line.endsWith('/');
+    if (dirOnly) line = line.slice(0, -1);
+    const anchored = line.includes('/'); // a slash other than a trailing one ties it to this folder
+    if (line[0] === '/') line = line.slice(1);
+    if (line) rules.push({ neg, dirOnly, re: new RegExp(`^${anchored ? '' : '(?:.*/)?'}${globSource(line)}$`) });
+  }
+  return { dir, rules };
+}
+
+// path => ignored, for a list of parsed .gitignore files. As in git: deeper files beat shallower ones,
+// the last matching rule wins, and nothing inside an ignored folder can be re-included.
+function gitignoreMatcher(sets) {
+  sets = [...sets].sort((a, b) => depth(a.dir) - depth(b.dir));
+  const test = (path, isDir) => {
+    let out = false;
+    for (const { dir, rules } of sets) {
+      if (dir && !path.startsWith(`${dir}/`)) continue;
+      const rel = dir ? path.slice(dir.length + 1) : path;
+      for (const r of rules) if ((isDir || !r.dirOnly) && r.re.test(rel)) out = !r.neg;
+    }
+    return out;
+  };
+  const folders = new Map();
+  const inIgnored = path => { const up = path.lastIndexOf('/'); return up > 0 && folder(path.slice(0, up)); };
+  const folder = path => {
+    if (!folders.has(path)) folders.set(path, inIgnored(path) || test(path, true));
+    return folders.get(path);
+  };
+  return path => (path.endsWith('/') ? folder(path.slice(0, -1)) : inIgnored(path) || test(path, false));
 }
 
 // git's blob SHA-1: sha1("blob <length>\0" + bytes)
@@ -116,6 +189,7 @@ module.exports = class GitHubApiSync extends Plugin {
     this.settings = Object.assign({}, DEFAULTS, data.settings || (data.state ? {} : data));
     if (!this.settings.device) this.settings.device = defaultDevice();
     this.state = data.state || {};
+    this.gitSets = { remote: [], local: [] };
     this.busy = false;
     this.addSettingTab(new SyncSettingTab(this.app, this));
     this.addRibbonIcon('refresh-cw', 'Sync with GitHub', () => this.sync());
@@ -176,6 +250,20 @@ module.exports = class GitHubApiSync extends Plugin {
     return path === this.dataPath || matches(path, ALWAYS_IGNORE) || matches(rel, this.rules);
   }
 
+  // Whether the repo's .gitignore files ignore this synced path. GitHub's copies and the vault's are
+  // both read; a path either of them ignores is ignored, so an older copy can't let a file out.
+  gitIgnored(rel) {
+    if (!this.settings.gitignore) return false;
+    const g = this.git || (this.git = { remote: gitignoreMatcher(this.gitSets.remote), local: gitignoreMatcher(this.gitSets.local) });
+    const path = join(this.settings.repoFolder, rel);
+    return g.remote(path) || g.local(path);
+  }
+
+  addGitignore(side, text, dir) {
+    this.gitSets[side].push(parseGitignore(text, dir));
+    this.git = null;
+  }
+
   // Pull, then push unless push is false. Retries if the branch moves while pushing.
   async sync({ push = true } = {}) {
     if (this.busy) { new Notice('Sync is already running'); return 'busy'; }
@@ -207,6 +295,8 @@ module.exports = class GitHubApiSync extends Plugin {
   async syncOnce(push, progress) {
     const s = this.settings, a = this.adapter;
     this.rules = parseRules(s.ignore);
+    this.gitSets = { remote: [], local: [] };
+    this.git = null;
     const key = `${s.repo}@${s.branch}:${s.repoFolder}>${s.vaultFolder}`;
     if (this.state.key !== key) this.state = { key, commit: null, base: {}, local: {} };
     const base = this.state.base;
@@ -217,20 +307,33 @@ module.exports = class GitHubApiSync extends Plugin {
     const tree = await this.api(`/repos/${s.repo}/git/trees/${headTree}?recursive=1`);
     if (tree.truncated) throw new Error('The repo tree is too large to read in one request');
     const prefix = s.repoFolder ? `${s.repoFolder}/` : '';
-    const remote = {}, modes = {}, known = new Set();
+    const remote = {}, modes = {}, known = new Set(), gitignores = [];
+    // .gitignore files that can apply to the synced folder: in it, below it, or in a folder above it.
+    const applies = dir => !dir || dir.startsWith(prefix) || `${s.repoFolder}/`.startsWith(`${dir}/`);
     for (const e of tree.tree) {
       if (e.type !== 'blob') continue;
       known.add(e.sha);
-      if (!e.path.startsWith(prefix) || e.mode === '120000') continue;
+      if (e.mode === '120000') continue;
+      if (s.gitignore && /(^|\/)\.gitignore$/.test(e.path) && applies(e.path.slice(0, -11))) gitignores.push(e);
+      if (!e.path.startsWith(prefix)) continue;
       const rel = e.path.slice(prefix.length);
       if (this.ignored(rel)) continue;
       remote[rel] = e.sha;
       modes[rel] = e.mode;
     }
 
+    const fetchBlob = async sha => base64ToArrayBuffer((await this.api(`/repos/${s.repo}/git/blobs/${sha}`)).content.replace(/\s/g, ''));
+    if (gitignores.length) progress('reading .gitignore');
+    const texts = this.gitignoreTexts || (this.gitignoreTexts = {}); // by blob SHA, so an unchanged one isn't downloaded again
+    await pool(gitignores, async e => {
+      if (!(e.sha in texts)) texts[e.sha] = new TextDecoder().decode(await fetchBlob(e.sha));
+      this.addGitignore('remote', texts[e.sha], e.path.slice(0, -11));
+    });
+
     progress('reading the vault');
-    const cache = {};
-    const local = await this.scanLocal(cache, Object.keys(base).length > 0);
+    const cache = {}, held = [];
+    const local = await this.scanLocal(cache, Object.keys(base).length > 0, held);
+    for (const rel of Object.keys(remote)) if (this.gitIgnored(rel)) delete remote[rel];
 
     // Plan. Every path is on at most one list.
     const down = [], trash = [], up = [], del = [], both = [], next = {};
@@ -255,7 +358,6 @@ module.exports = class GitHubApiSync extends Plugin {
     }
 
     const vpath = rel => join(s.vaultFolder, rel);
-    const fetchBlob = async sha => base64ToArrayBuffer((await this.api(`/repos/${s.repo}/git/blobs/${sha}`)).content.replace(/\s/g, ''));
     const write = async (rel, buf, sha) => {
       const p = vpath(rel), dir = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
       if (dir) await this.ensureDir(dir);
@@ -321,11 +423,13 @@ module.exports = class GitHubApiSync extends Plugin {
     if (pushed) parts.push(`${plural(pushed, 'change')} pushed`);
     if (!push && (up.length || del.length)) parts.push(`${plural(up.length + del.length, 'local change')} not pushed`);
     if (both.length) parts.push(`${plural(both.length, 'conflict')} kept as "(conflict ${s.device} ...)" copies`);
-    return parts.length ? `Synced: ${parts.join(', ')}` : 'Already in sync';
+    const report = parts.length ? `Synced: ${parts.join(', ')}` : 'Already in sync';
+    return held.length ? `${report}. ${plural(held.length, 'local file')} skipped by .gitignore` : report;
   }
 
   // rel -> blob SHA for every synced file in the vault folder. Rehashes only files whose mtime or size changed.
-  async scanLocal(cache, hadBase) {
+  // Reads each folder's .gitignore before anything in it, and lists the files .gitignore holds back in held.
+  async scanLocal(cache, hadBase, held = []) {
     const a = this.adapter, root = this.settings.vaultFolder, old = this.state.local || {}, out = {};
     if (root && !(await a.exists(root))) {
       if (hadBase) throw new Error(`Vault folder "${root}" is missing; not syncing so nothing gets deleted`);
@@ -333,19 +437,25 @@ module.exports = class GitHubApiSync extends Plugin {
       return out;
     }
     const relOf = p => { p = p.replace(/^\/+/, ''); return root ? p.slice(root.length + 1) : p; };
-    const walk = async dir => {
+    const walk = async (dir, skip) => {
       const { files, folders } = await a.list(dir || '/');
+      const gi = !skip && this.settings.gitignore && files.find(f => /(^|\/)\.gitignore$/.test(f));
+      if (gi) this.addGitignore('local', new TextDecoder().decode(await a.readBinary(gi)), join(this.settings.repoFolder, relOf(dir)));
       for (const f of files) {
         const rel = relOf(f);
         if (!rel || this.ignored(rel)) continue;
+        if (skip || this.gitIgnored(rel)) { held.push(rel); continue; }
         const st = await a.stat(f), c = old[rel];
         const sha = c && c.mtime === st.mtime && c.size === st.size ? c.sha : await blobSha(await a.readBinary(f));
         cache[rel] = { mtime: st.mtime, size: st.size, sha };
         out[rel] = sha;
       }
-      for (const d of folders) if (!this.ignored(`${relOf(d)}/`)) await walk(d.replace(/^\/+/, ''));
+      for (const d of folders) {
+        const rel = `${relOf(d)}/`;
+        if (!this.ignored(rel)) await walk(d.replace(/^\/+/, ''), skip || this.gitIgnored(rel)); // an ignored folder is walked only to count
+      }
     };
-    await walk(root);
+    await walk(root, false);
     return out;
   }
 
@@ -406,6 +516,10 @@ class SyncSettingTab extends PluginSettingTab {
         t.inputEl.rows = 10;
         t.inputEl.style.width = '100%';
       });
+    new Setting(containerEl)
+      .setName('Honour the repo\'s .gitignore')
+      .setDesc('Files ignored by the repo\'s .gitignore files (GitHub\'s copies or this vault\'s) are neither pulled nor pushed, in both directions. This adds to the ignore rules above; it doesn\'t replace them.')
+      .addToggle(t => t.setValue(s.gitignore).onChange(async v => { s.gitignore = v; await p.saveSettings(); }));
 
     const result = containerEl.createEl('p', { cls: 'setting-item-description' });
     const run = (label, fn) => b => b.setButtonText(label).onClick(async () => {
@@ -434,3 +548,6 @@ class SyncSettingTab extends PluginSettingTab {
     containerEl.appendChild(result);
   }
 }
+
+// For the tests in test/. Obsidian only uses the class itself.
+module.exports.__test = { parseGitignore, gitignoreMatcher, globSource };
